@@ -5,8 +5,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -274,22 +279,74 @@ func testHTTPDatastoreRepeat(t *testing.T) {
 	} else {
 		t.Log("Running HTTP repeat test suite.")
 
+		// make a random file
+		infile := httpDownloadDir + "input"
+		if _, err := os.Stat(infile); err == nil {
+			if err := os.Remove(infile); err != nil {
+				t.Fatalf("unable to remove existing file %s %v", infile, err)
+			}
+		}
+		f, err := os.Create(infile)
+		if err != nil {
+			t.Fatalf("unable to create file %s %v", infile, err)
+		}
+		defer os.RemoveAll(infile)
+		size := 1024 * 1024 * 100
+		bufSize := 1024 * 1024
+		randReader := io.LimitReader(rand.New(rand.NewSource(time.Now().UnixNano())), int64(size))
+		for {
+			buf := make([]byte, bufSize)
+			_, err := randReader.Read(buf)
+			if err != nil && err != io.EOF {
+				t.Fatalf("unable to read from random reader %v", err)
+			}
+			if _, err := f.Write(buf); err != nil {
+				t.Fatalf("unable to write to file %s %v", infile, err)
+			}
+			if err == io.EOF {
+				break
+			}
+		}
+		f.Close()
+		// get a hash of the file
+		inHash, err := sha256File(infile)
+		if err != nil {
+			t.Fatalf("unable to get hash of input file %s %v", infile, err)
+		}
+
+		// create the test server
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFile(w, r, infile)
+		}))
+		defer ts.Close()
+		u, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatalf("unable to parse url %s %v", ts.URL, err)
+		}
+		rport, err := strconv.Atoi(u.Port())
+		if err != nil {
+			t.Fatalf("unable to parse port %s %v", u.Port(), err)
+		}
+		lport := 9999
+
+		// start the proxy
 		go func() {
-			err := newUnstableProxyStart(9999, 80, "cloud-images.ubuntu.com", 1024*1024*100, 40*time.Second, 100)
+			err := newUnstableProxyStart(lport, rport, u.Hostname(), 1024*1024*100, 40*time.Second, 100)
 			if err != nil {
 				t.Error(err)
 			}
 		}()
 
-		status, msg := operationHTTP(t, httpDownloadDir+"repeat2", "releases/focal/release/ubuntu-20.04.2-preinstalled-server-riscv64.img.xz", "http://127.0.0.1:9999", "", zedUpload.SyncOpDownload, true)
+		outfile := httpDownloadDir + "repeat2"
+		status, msg := operationHTTP(t, outfile, "path/does/not/matter/with/fixed/server", fmt.Sprintf("http://%s:%d", "127.0.0.1", lport), "", zedUpload.SyncOpDownload, true)
 		if status {
 			t.Errorf("%v", msg)
 		}
-		hashSum, err := sha256File(httpDownloadDir + "repeat2")
+		hashSum, err := sha256File(outfile)
 		if err != nil {
 			t.Errorf("%v", err)
 		} else {
-			if hashSum != "cd8d892bfff2b7167e51395f462b6096f657e61de325acd97da2272769efa761" {
+			if hashSum != inHash {
 				t.Errorf("hash mismatch")
 			}
 		}
