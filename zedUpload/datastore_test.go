@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -139,8 +140,8 @@ func md5sum(r io.ReadSeeker, start, length int64) ([]byte, error) {
 }
 
 type unstableProxyCtx struct {
-	limited       bool
-	limit         bool
+	limited       atomic.Bool
+	limit         atomic.Bool
 	startFromByte uint64
 	delay         time.Duration
 	dropPercent   int
@@ -238,14 +239,14 @@ func (p *unstableProxy) pipe(src, dst io.ReadWriteCloser) {
 	deferClose := false
 	for deferClose == false {
 		if !isSend {
-			if p.receivedBytes+uint64(bufLen) > p.ctx.startFromByte && !p.ctx.limited {
-				if !p.ctx.limited && !p.ctx.limit {
+			if p.receivedBytes+uint64(bufLen) > p.ctx.startFromByte && !p.ctx.limited.Load() {
+				if !p.ctx.limited.Load() && !p.ctx.limit.Load() {
 					fmt.Println("Limit started at: ", time.Now().String())
-					p.ctx.limit = true
+					p.ctx.limit.Store(true)
 					time.AfterFunc(p.ctx.delay, func() {
 						fmt.Println("Limit ended at: ", time.Now().String())
-						p.ctx.limited = true
-						p.ctx.limit = false
+						p.ctx.limited.Store(true)
+						p.ctx.limit.Store(false)
 					})
 				}
 			}
@@ -261,7 +262,7 @@ func (p *unstableProxy) pipe(src, dst io.ReadWriteCloser) {
 			deferClose = true
 		}
 
-		discard := p.ctx.limit && r.Intn(100) < p.ctx.dropPercent
+		discard := p.ctx.limit.Load() && r.Intn(100) < p.ctx.dropPercent
 
 		if !discard {
 			n, err = dst.Write(buff[:n])
