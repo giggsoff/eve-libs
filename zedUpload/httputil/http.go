@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -215,6 +214,7 @@ func execCmdGet(ctx context.Context, objSize int64, localFile string, host strin
 	defer local.Close()
 
 	var errorList []string
+	done := false
 	supportRange := false //is server supports ranges requests, false for the first request
 	forceRestart := false
 	delay := time.Second
@@ -317,31 +317,39 @@ func execCmdGet(ctx context.Context, objSize int64, localFile string, host strin
 		var written int64
 		for {
 			var copyErr error
-
-			written, copyErr = io.CopyN(local, resp.Body, chunkSize)
-			copiedSize += written
-
-			if copyErr != nil {
-				if objSize != copiedSize && objSize != 0 {
-					if innerCtx.Err() != nil {
-						// the error comes from canceled context, which indicates inactivity timeout
-						appendToErrorList("inactivity for %s", inactivityTimeout)
-					} else if errors.Is(copyErr, io.EOF) {
-						appendToErrorList("premature EOF after %d out of %d bytes: %+v", copiedSize, objSize, copyErr)
-					} else {
-						appendToErrorList("error from CopyN after %d out of %d bytes: %v", copiedSize, objSize, copyErr)
-					}
-
-					stats.Error = fmt.Errorf("%s: %s", host, strings.Join(errorList, "; "))
+			if written, copyErr = io.CopyN(local, resp.Body, chunkSize); copyErr != nil && copyErr != io.EOF {
+				copiedSize += written
+				if innerCtx.Err() != nil {
+					// the error comes from canceled context, which indicates inactivity timeout
+					appendToErrorList("inactivity for %s", inactivityTimeout)
+				} else {
+					appendToErrorList("error from CopyN: %v", copyErr)
 				}
-				return stats, rsp
+				break
+			}
+			copiedSize += written
+			// we read chunk of data from response on each iteration, if data length is a multiple of chunkSize
+			// on the last iteration we will read 0 bytes and will hit written != chunkSize
+			if written != chunkSize {
+				// Must have reached EOF
+				done = true
+				break
 			}
 			//we received data so re-schedule inactivity timer
 			inactivityTimer.Reset(inactivityTimeout)
 			stats.Asize = copiedSize
 			types.SendStats(prgNotify, stats)
 		}
+		if done {
+			break
+		}
+		err = resp.Body.Close()
+		if err != nil {
+			appendToErrorList("error close Body: %v", err)
+		}
 	}
-	stats.Error = fmt.Errorf("%s: %s", host, strings.Join(errorList, "; "))
+	if !done {
+		stats.Error = fmt.Errorf("%s: %s", host, strings.Join(errorList, "; "))
+	}
 	return stats, rsp
 }
